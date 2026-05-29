@@ -1,67 +1,101 @@
 // Author: Raisul Islam (raisul.aust1@gmail.com)
 // Fully native Frappe Framework field dictionary integration.
 (function () {
+    // In-memory L1 cache; also the canonical source for what gets persisted to L2.
     const cache = {};
     const pending = {};
     let realtime_bound = false;
     let theme_observer_bound = false;
     let boot_hydrated = false;
+    let local_loaded = false;
 
-    const STORAGE_PREFIX = "section_icon:v1:";
+    // Single-key bundle in localStorage: one parse on first use, one write per change.
+    const STORAGE_KEY = "section_icon:v2:bundle";
     const STORAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    const LEGACY_PREFIX = "section_icon:v1:";
 
     function get_boot_version() {
         return (window.frappe && frappe.boot && frappe.boot.section_icon_version) || "";
     }
 
-    function hydrate_from_boot() {
-        if (boot_hydrated) return;
-        boot_hydrated = true;
-        const preload = window.frappe && frappe.boot && frappe.boot.section_icons;
-        if (!preload || typeof preload !== "object") return;
-        Object.keys(preload).forEach(function (doctype) {
-            if (!cache[doctype]) cache[doctype] = preload[doctype] || {};
-        });
-    }
-
-    function read_local(doctype) {
+    function purge_legacy_keys() {
         try {
-            const raw = localStorage.getItem(STORAGE_PREFIX + doctype);
-            if (!raw) return null;
-            const parsed = JSON.parse(raw);
-            if (!parsed || parsed.version !== get_boot_version()) return null;
-            if (!parsed.ts || Date.now() - parsed.ts > STORAGE_TTL_MS) return null;
-            return parsed.icons || null;
-        } catch (e) {
-            return null;
-        }
-    }
-
-    function write_local(doctype, icons) {
-        try {
-            localStorage.setItem(STORAGE_PREFIX + doctype, JSON.stringify({
-                icons: icons,
-                version: get_boot_version(),
-                ts: Date.now(),
-            }));
-        } catch (e) {
-            // quota or unavailable — silently skip
-        }
-    }
-
-    function clear_local(doctype) {
-        try {
-            if (doctype) {
-                localStorage.removeItem(STORAGE_PREFIX + doctype);
-                return;
-            }
             for (let i = localStorage.length - 1; i >= 0; i--) {
                 const key = localStorage.key(i);
-                if (key && key.indexOf(STORAGE_PREFIX) === 0) localStorage.removeItem(key);
+                if (key && key.indexOf(LEGACY_PREFIX) === 0) localStorage.removeItem(key);
             }
         } catch (e) {
             // ignore
         }
+    }
+
+    function load_local_once() {
+        if (local_loaded) return;
+        local_loaded = true;
+        purge_legacy_keys();
+        let raw;
+        try {
+            raw = localStorage.getItem(STORAGE_KEY);
+        } catch (e) {
+            return;
+        }
+        if (!raw) return;
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (e) {
+            try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+            return;
+        }
+        if (!parsed || parsed.version !== get_boot_version()) {
+            try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+            return;
+        }
+        if (!parsed.ts || Date.now() - parsed.ts > STORAGE_TTL_MS) {
+            try { localStorage.removeItem(STORAGE_KEY); } catch (_) {}
+            return;
+        }
+        const icons = parsed.icons || {};
+        Object.keys(icons).forEach(function (dt) {
+            if (!cache[dt]) cache[dt] = icons[dt] || {};
+        });
+    }
+
+    function persist_local() {
+        try {
+            localStorage.setItem(STORAGE_KEY, JSON.stringify({
+                version: get_boot_version(),
+                ts: Date.now(),
+                icons: cache,
+            }));
+        } catch (e) {
+            // quota exceeded or storage unavailable — keep L1 only
+        }
+    }
+
+    function hydrate_from_boot() {
+        if (boot_hydrated) return;
+        boot_hydrated = true;
+        load_local_once();
+        const preload = window.frappe && frappe.boot && frappe.boot.section_icons;
+        if (!preload || typeof preload !== "object") return;
+        let changed = false;
+        Object.keys(preload).forEach(function (doctype) {
+            // Boot data is authoritative for the current server version.
+            cache[doctype] = preload[doctype] || {};
+            changed = true;
+        });
+        if (changed) persist_local();
+    }
+
+    function invalidate_doctype(doctype) {
+        if (doctype) {
+            if (cache.hasOwnProperty(doctype)) delete cache[doctype];
+            persist_local();
+            return;
+        }
+        Object.keys(cache).forEach(function (k) { delete cache[k]; });
+        try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
     }
 
     const NAMED_COLORS = {
@@ -232,27 +266,17 @@
         if (realtime_bound) return;
         if (!window.frappe || !frappe.realtime || !frappe.realtime.on) return;
         frappe.realtime.on("section_icon_updated", function (data) {
-            if (data && data.for_doctype) {
-                delete cache[data.for_doctype];
-                clear_local(data.for_doctype);
-            } else {
-                Object.keys(cache).forEach(function (k) { delete cache[k]; });
-                clear_local(null);
-            }
+            invalidate_doctype(data && data.for_doctype);
         });
         realtime_bound = true;
     }
 
     function fetch_icons(doctype) {
+        // First call: parse the single bundle key into the in-memory map.
+        // Subsequent calls: pure O(1) object lookup, no disk I/O.
         hydrate_from_boot();
         if (cache[doctype]) return Promise.resolve(cache[doctype]);
         if (pending[doctype]) return pending[doctype];
-
-        const stored = read_local(doctype);
-        if (stored) {
-            cache[doctype] = stored;
-            return Promise.resolve(stored);
-        }
 
         pending[doctype] = frappe
             .xcall("section_icon.api.get_icons_for", { doctype: doctype })
@@ -265,7 +289,7 @@
                     };
                 });
                 cache[doctype] = map;
-                write_local(doctype, map);
+                persist_local();
                 delete pending[doctype];
                 return map;
             })
